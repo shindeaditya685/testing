@@ -22,30 +22,19 @@ function elapsed() {
   return `${h}h ${m}m`;
 }
 
-// ── Start Express FIRST before anything else ──
-// Railway checks this immediately on startup
 const app = express();
 app.get('/', (req, res) => res.send(`
   <h2>✅ Free4Talk Keeper Running</h2>
   <p>Room: <a href="${ROOM_URL}">${ROOM_URL}</a></p>
   <p>Uptime: ${elapsed()}</p>
-  <p>Started: ${new Date(startTime).toISOString()}</p>
 `));
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: elapsed() }));
 
-// Start server synchronously before browser launches
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] ✅ Listening on 0.0.0.0:${PORT}`);
-  // Only start browser AFTER server is confirmed listening
   joinRoom();
 });
 
-server.on('error', (err) => {
-  console.error(`[Server] ❌ Failed to bind port: ${err.message}`);
-  process.exit(1);
-});
-
-// ── Browser Logic ──
 async function joinRoom() {
   console.log(`\n[Keeper] Starting... Uptime: ${elapsed()}`);
 
@@ -60,11 +49,13 @@ async function joinRoom() {
         '--use-fake-device-for-media-stream',
         '--disable-blink-features=AutomationControlled',
         '--disable-gpu',
+        '--allow-running-insecure-content',
+        '--autoplay-policy=no-user-gesture-required',
       ],
     });
 
     const context = await browser.newContext({
-      permissions: ['microphone'],
+      permissions: ['microphone', 'camera'],
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
     });
@@ -74,6 +65,23 @@ async function joinRoom() {
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
       window.chrome = { runtime: {} };
+
+      // Fake microphone/audio so WebRTC thinks there's a real audio stream
+      const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+      navigator.mediaDevices.getUserMedia = async (constraints) => {
+        try {
+          return await origGetUserMedia(constraints);
+        } catch (e) {
+          // Create a silent audio track as fallback
+          const ctx = new AudioContext();
+          const dst = ctx.createMediaStreamDestination();
+          const oscillator = ctx.createOscillator();
+          oscillator.frequency.value = 0; // silent
+          oscillator.connect(dst);
+          oscillator.start();
+          return dst.stream;
+        }
+      };
     });
 
     // Inject identity.free4talk.com
@@ -102,17 +110,44 @@ async function joinRoom() {
     const page = await context.newPage();
     page.on('pageerror', () => {});
 
+    // Log websocket and important network activity
+    page.on('request', req => {
+      const url = req.url();
+      if (url.includes('ws') || url.includes('socket') || url.includes('webrtc') || url.includes('peer') || url.includes('join')) {
+        console.log(`[NET] ${req.method()} ${url.substring(0, 120)}`);
+      }
+    });
+    page.on('response', async res => {
+      const url = res.url();
+      if (url.includes('join') || url.includes('room') || url.includes('peer')) {
+        console.log(`[NET] ${res.status()} ${url.substring(0, 120)}`);
+        try {
+          const text = await res.text();
+          if (text && text.length < 500) console.log(`[NET] Body: ${text}`);
+        } catch {}
+      }
+    });
+
+    // Log page console messages
+    page.on('console', msg => {
+      const text = msg.text();
+      if (text.includes('join') || text.includes('room') || text.includes('peer') || 
+          text.includes('connect') || text.includes('user') || text.includes('error')) {
+        console.log(`[PAGE] ${msg.type()}: ${text.substring(0, 200)}`);
+      }
+    });
+
     await page.goto(ROOM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(5000);
 
-    // Dismiss popups
     await dismissPopups(page);
 
-    // Click to enter room
+    // Click to enter
     try {
       const startText = page.locator('text=Click on anywhere to start').first();
       if (await startText.isVisible({ timeout: 3000 })) {
         await startText.click();
+        console.log('[Keeper] ✅ Clicked to start');
       } else {
         await page.mouse.click(400, 300);
       }
@@ -120,10 +155,25 @@ async function joinRoom() {
       await page.mouse.click(400, 300);
     }
 
-    await page.waitForTimeout(5000);
+    // Wait longer for WebRTC to establish
+    console.log('[Keeper] Waiting 15s for WebRTC to connect...');
+    await page.waitForTimeout(15000);
+
+    // Dump page state
+    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 1000) || '');
+    console.log('[Keeper] Page text after join:\n' + pageText);
+
+    // Check participant count
+    const participants = await page.evaluate(() => {
+      // Look for participant elements
+      const cards = document.querySelectorAll('[class*="participant"], [class*="user"], [class*="member"], [class*="avatar"]');
+      return Array.from(cards).map(el => ({ class: el.className?.substring(0, 60), text: el.textContent?.trim()?.substring(0, 40) }));
+    });
+    console.log('[Keeper] Participant elements found:', JSON.stringify(participants.slice(0, 10)));
+
     console.log(`[Keeper] ✅ In room: ${page.url()} | Uptime: ${elapsed()}`);
 
-    // Reload every 18 minutes to stay alive
+    // Reload every 18 minutes
     setInterval(async () => {
       try {
         console.log(`[Keeper] 🔄 Reloading... Uptime: ${elapsed()}`);
